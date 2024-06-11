@@ -6322,59 +6322,134 @@ SwitchLookupTable::SwitchLookupTable(
     return;
   }
 
+  assert(
+      2 <= std::count_if(TableContents.begin(), TableContents.end(),
+                         [](const auto *C) { return !isa<PoisonValue>(C); }) &&
+      "Should be a SingleValue table.");
+
   // Check if we can derive the value with a linear transformation from the
   // table index.
   if (isa<IntegerType>(ValueType)) {
-    bool LinearMappingPossible = true;
-    APInt PrevVal;
-    APInt DistToPrev;
-    // When linear map is monotonic and signed overflow doesn't happen on
-    // maximum index, we can attach nsw on Add and Mul.
-    bool NonMonotonic = false;
-    assert(TableSize >= 2 && "Should be a SingleValue table.");
-    // Check if there is the same distance between two consecutive values.
-    for (uint64_t I = 0; I < TableSize; ++I) {
-      ConstantInt *ConstVal = dyn_cast<ConstantInt>(TableContents[I]);
+    // If we can find two consecutive lookup table entries with a defined value,
+    // we can unambiguously determine the multiplier by computing the difference
+    bool FoundMultiplier = false;
+    APInt OffsetVal;
+    APInt MultiplierVal;
+    for (uint64_t I = 1; I < TableSize; ++I) {
+      ConstantInt *ConstValPrev = dyn_cast<ConstantInt>(TableContents[I - 1]);
+      ConstantInt *ConstValNext = dyn_cast<ConstantInt>(TableContents[I]);
+      if (ConstValPrev && ConstValNext) {
+        FoundMultiplier = true;
 
-      if (!ConstVal && TableContents[I] == DefaultValue) {
-        // This is an undef, but is also (probably) a lookup table hole. To
-        // prevent any regressions from before we switched to using poison as
-        // the default value, holes will fall back to using the first value.
-        // This can be removed once we add proper handling for undefs in lookup
-        // tables.
-        ConstVal = dyn_cast<ConstantInt>(Values[0].second);
-      }
-
-      if (!ConstVal) {
-        // This is an undef. We could deal with it, but undefs in lookup tables
-        // are very seldom. It's probably not worth the additional complexity.
-        LinearMappingPossible = false;
+        const APInt &PrevVal = ConstValPrev->getValue();
+        const APInt &NextVal = ConstValNext->getValue();
+        MultiplierVal = NextVal - PrevVal;
+        OffsetVal = NextVal - MultiplierVal * I;
         break;
       }
-      const APInt &Val = ConstVal->getValue();
-      if (I != 0) {
-        APInt Dist = Val - PrevVal;
-        if (I == 1) {
-          DistToPrev = Dist;
-        } else if (Dist != DistToPrev) {
+    }
+
+    // If there are no two consecutive lookup table entries with a defined
+    // value, find any two defined entries and try to compute a multiplier
+    // based on their values using the multiplicative inverse.
+    if (!FoundMultiplier) {
+      auto NotPoisonPredicate = [](const auto *C) {
+        return !isa<PoisonValue>(C);
+      };
+
+      // Find the first two table entries with a defined value.
+      // This choice is not optimal - we'd get best results if we preferred to
+      // choose a pair of entries with different values, separated by an odd
+      // number of table indices. However, that would add a lot of complexity,
+      // and it would only improve detection of linear mappings with overflows,
+      // which are not as common.
+      auto First = std::find_if(TableContents.begin(), TableContents.end(),
+                                NotPoisonPredicate);
+      auto Second =
+          std::find_if(First + 1, TableContents.end(), NotPoisonPredicate);
+      assert(First != TableContents.end() && Second != TableContents.end() &&
+             "Should have at least two defined values");
+      assert(isa<ConstantInt>(*First) && isa<ConstantInt>(*Second) &&
+             "Should both be ConstantInt");
+
+      uint64_t FirstIndex = First - TableContents.begin();
+      uint64_t SecondIndex = Second - TableContents.begin();
+      const APInt &FirstVal = cast<ConstantInt>(*First)->getValue();
+      const APInt &SecondVal = cast<ConstantInt>(*Second)->getValue();
+
+      // The number of table indices separating the two values, truncated
+      APInt IndexDist(FirstVal.getBitWidth(), SecondIndex - FirstIndex);
+
+      // The difference between the two values
+      APInt ValDist = SecondVal - FirstVal;
+
+      // We need to find an integer M such that M * IndexDist = ValDist.
+      // If the multiplicative inverse of IndexDist exists, we can compute M by:
+      //   M = ValDist * (1 / IndexDist)
+      // However, this only works if IndexDist is odd.
+
+      // If IndexDist is even (specifically, if it's divisible by 2^N), we can
+      // make it odd if ValDist is also divisible by 2^N.
+      //   M * IndexDist         = ValDist
+      //   M * (IndexDist / 2^N) = ValDist / 2^N
+      unsigned N = IndexDist.countTrailingZeros();
+      if (N <= ValDist.countTrailingZeros()) {
+        IndexDist.ashrInPlace(N);
+        ValDist.ashrInPlace(N);
+      }
+
+      // If IndexDist is odd (i.e. bit 0 is set), we can proceed:
+      if (IndexDist[0]) {
+        FoundMultiplier = true;
+        MultiplierVal = IndexDist.multiplicativeInverse() * ValDist;
+        OffsetVal = FirstVal - MultiplierVal * FirstIndex;
+
+        assert(OffsetVal + MultiplierVal * FirstIndex == FirstVal &&
+               OffsetVal + MultiplierVal * SecondIndex == SecondVal);
+      }
+    }
+
+    if (FoundMultiplier) {
+      bool LinearMappingPossible = true;
+      // When linear map is monotonic and signed overflow doesn't happen on
+      // maximum index, we can attach nsw on Add and Mul.
+      bool NonMonotonic = false;
+      // Check if the offset and multiplier actually give the correct result in
+      // all cases.
+      for (uint64_t I = 0; I < TableSize; ++I) {
+        ConstantInt *ConstVal = dyn_cast<ConstantInt>(TableContents[I]);
+        if (!ConstVal) {
+          assert(isa<UndefValue>(TableContents[I]) &&
+                 "Expected ConstantInt or undef");
+
+          // This is undef. We don't care what the linear mapping evaluates
+          // to, so we'll allow it.
+          continue;
+        }
+        const APInt &Val = ConstVal->getValue();
+        APInt ComputedVal = OffsetVal + MultiplierVal * I;
+        if (Val != ComputedVal) {
           LinearMappingPossible = false;
           break;
         }
-        NonMonotonic |=
-            Dist.isStrictlyPositive() ? Val.sle(PrevVal) : Val.sgt(PrevVal);
+        if (I != 0) {
+          APInt PrevVal = ComputedVal - MultiplierVal;
+          NonMonotonic |= MultiplierVal.isStrictlyPositive() ? Val.sle(PrevVal)
+                                                             : Val.sgt(PrevVal);
+        }
       }
-      PrevVal = Val;
-    }
-    if (LinearMappingPossible) {
-      LinearOffset = cast<ConstantInt>(TableContents[0]);
-      LinearMultiplier = ConstantInt::get(M.getContext(), DistToPrev);
-      bool MayWrap = false;
-      APInt M = LinearMultiplier->getValue();
-      (void)M.smul_ov(APInt(M.getBitWidth(), TableSize - 1), MayWrap);
-      LinearMapValWrapped = NonMonotonic || MayWrap;
-      Kind = LinearMapKind;
-      ++NumLinearMaps;
-      return;
+
+      if (LinearMappingPossible) {
+        LinearOffset = ConstantInt::get(M.getContext(), OffsetVal);
+        LinearMultiplier = ConstantInt::get(M.getContext(), MultiplierVal);
+        bool MayWrap = false;
+        (void)MultiplierVal.smul_ov(
+            APInt(MultiplierVal.getBitWidth(), TableSize - 1), MayWrap);
+        LinearMapValWrapped = NonMonotonic || MayWrap;
+        Kind = LinearMapKind;
+        ++NumLinearMaps;
+        return;
+      }
     }
   }
 
